@@ -24,8 +24,7 @@ are opaque strings, unique for the lifetime of a pool, and stable across
 defragmentation: moving a block changes its offset, never its handle.
 """
 
-import bisect
-import collections
+import copy
 from collections.abc import Iterable, Mapping, Sequence
 
 
@@ -35,6 +34,25 @@ class PoolError(Exception):
     All public operations report contract violations with this exception;
     no partial mutation is allowed before it is raised.
     """
+
+
+def _is_int(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _check_alignment(alignment: int) -> int:
+    """Return *alignment* if it is a positive power of two, else raise."""
+    if not _is_int(alignment) or alignment <= 0 or (alignment & (alignment - 1)) != 0:
+        raise PoolError(
+            f"alignment must be a positive power of two, got {alignment!r}"
+        )
+    return alignment
+
+
+def _mint_handle(pool: dict) -> str:
+    handle = f"handle-{pool['next_id']}"
+    pool["next_id"] += 1
+    return handle
 
 
 def align_size(size: int, alignment: int) -> int:
@@ -49,7 +67,11 @@ def align_size(size: int, alignment: int) -> int:
     ``size``, so an allocation of that size cannot spill into its neighbour.
     ``align_size(0, alignment) == 0`` for every valid alignment.
     """
-    raise NotImplementedError
+    if not _is_int(size) or size < 0:
+        raise PoolError(f"size must be a non-negative integer, got {size!r}")
+    _check_alignment(alignment)
+    # Round UP: (size + alignment - 1) with the low bits cleared.
+    return (size + alignment - 1) & ~(alignment - 1)
 
 
 def allocate(pool: dict, request: Mapping) -> dict:
@@ -72,7 +94,80 @@ def allocate(pool: dict, request: Mapping) -> dict:
     ``PoolError``; this function does not grow the pool implicitly (call
     :func:`grow` first). Invalid size/align values raise ``PoolError``.
     """
-    raise NotImplementedError
+    size = request["size"]
+    align = request["align"]
+    tag = request["tag"]
+    # Validates both size and alignment before any mutation.
+    aligned = align_size(size, align)
+
+    if aligned == 0:
+        # Zero-byte request: consumes no capacity, always succeeds.
+        handle = _mint_handle(pool)
+        pool["blocks"].insert(
+            0, {"offset": 0, "size": 0, "handle": handle, "tag": tag}
+        )
+        return {"handle": handle, "offset": 0, "size": 0, "tag": tag}
+
+    # Best fit: smallest free extent that fits (including alignment
+    # padding), ties broken by lowest offset.
+    best = None  # (extent size, offset, index, padding)
+    for index, block in enumerate(pool["blocks"]):
+        if block["handle"] is not None:
+            continue
+        padding = (-block["offset"]) % align
+        if padding + aligned > block["size"]:
+            continue
+        key = (block["size"], block["offset"])
+        if best is None or key < best[0]:
+            best = (key, index, padding)
+    if best is None:
+        raise PoolError(
+            f"no free extent fits {aligned} bytes (alignment {align})"
+        )
+
+    _, index, padding = best
+    block = pool["blocks"][index]
+    offset = block["offset"] + padding
+    remainder = block["size"] - padding - aligned
+    handle = _mint_handle(pool)
+
+    replacement = []
+    if padding:
+        replacement.append(
+            {"offset": block["offset"], "size": padding, "handle": None, "tag": None}
+        )
+    replacement.append(
+        {"offset": offset, "size": aligned, "handle": handle, "tag": tag}
+    )
+    if remainder:
+        replacement.append(
+            {
+                "offset": offset + aligned,
+                "size": remainder,
+                "handle": None,
+                "tag": None,
+            }
+        )
+    pool["blocks"][index : index + 1] = replacement
+    return {"handle": handle, "offset": offset, "size": aligned, "tag": tag}
+
+
+def _coalesce(pool: dict) -> None:
+    """Merge every run of touching free extents into one; drop empty ones."""
+    merged = []
+    for block in pool["blocks"]:
+        if block["handle"] is None and block["size"] == 0:
+            continue
+        if (
+            merged
+            and merged[-1]["handle"] is None
+            and block["handle"] is None
+            and merged[-1]["offset"] + merged[-1]["size"] == block["offset"]
+        ):
+            merged[-1]["size"] += block["size"]
+        else:
+            merged.append(block)
+    pool["blocks"] = merged
 
 
 def release(pool: dict, handle: str) -> dict:
@@ -88,7 +183,26 @@ def release(pool: dict, handle: str) -> dict:
     and size describe the allocation that was released, before coalescing.
     Released handles are retired and are never handed out again.
     """
-    raise NotImplementedError
+    if not isinstance(handle, str):
+        raise PoolError(f"invalid handle {handle!r}")
+    index = None
+    for i, block in enumerate(pool["blocks"]):
+        if block["handle"] is not None and block["handle"] == handle:
+            index = i
+            break
+    if index is None:
+        raise PoolError(f"unknown or already-released handle {handle!r}")
+
+    block = pool["blocks"][index]
+    released = {"handle": handle, "offset": block["offset"], "size": block["size"]}
+    if block["size"] == 0:
+        # Zero-size allocations occupy no bytes; just drop the record.
+        del pool["blocks"][index]
+    else:
+        block["handle"] = None
+        block["tag"] = None
+    _coalesce(pool)
+    return released
 
 
 def defragment(pool: dict, keep_order: bool) -> dict:
@@ -115,7 +229,36 @@ def defragment(pool: dict, keep_order: bool) -> dict:
 
     Blocks that did not move are omitted from ``moved``.
     """
-    raise NotImplementedError
+    live = [block for block in pool["blocks"] if block["handle"] is not None]
+    if not keep_order:
+        # Reordering is permitted; larger blocks first packs at least as
+        # tightly and keeps the result deterministic.
+        live.sort(key=lambda block: (-block["size"], block["offset"]))
+
+    moved = []
+    cursor = 0
+    compacted = []
+    for block in live:
+        old_offset = block["offset"]
+        block["offset"] = cursor
+        if cursor != old_offset:
+            moved.append(
+                {
+                    "handle": block["handle"],
+                    "old_offset": old_offset,
+                    "new_offset": cursor,
+                }
+            )
+        cursor += block["size"]
+        compacted.append(block)
+
+    free = pool["capacity"] - cursor
+    if free:
+        compacted.append(
+            {"offset": cursor, "size": free, "handle": None, "tag": None}
+        )
+    pool["blocks"] = compacted
+    return {"moved": moved, "free": free}
 
 
 def stats(pool: dict) -> dict:
@@ -135,7 +278,17 @@ def stats(pool: dict) -> dict:
     total free bytes split into many small extents scores closer to 1.0.
     Zero-size allocations contribute nothing to ``used``.
     """
-    raise NotImplementedError
+    used = 0
+    free_sizes = []
+    for block in pool["blocks"]:
+        if block["handle"] is None:
+            if block["size"]:
+                free_sizes.append(block["size"])
+        else:
+            used += block["size"]
+    free = sum(free_sizes)
+    fragmentation = 0.0 if free == 0 else 1.0 - max(free_sizes) / free
+    return {"used": used, "free": free, "fragmentation": fragmentation}
 
 
 def grow(pool: dict, size: int) -> dict:
@@ -151,7 +304,28 @@ def grow(pool: dict, size: int) -> dict:
     Growth must honour the requested byte count rather than a fixed 1 MiB
     step, so a large request can succeed whenever the hard limit allows it.
     """
-    raise NotImplementedError
+    if not _is_int(size) or size <= 0:
+        raise PoolError(f"grow size must be a positive integer, got {size!r}")
+    new_capacity = pool["capacity"] + size
+    if new_capacity > pool["max_capacity"]:
+        raise PoolError(
+            f"growing by {size} bytes would exceed max_capacity "
+            f"{pool['max_capacity']}"
+        )
+    blocks = pool["blocks"]
+    if blocks and blocks[-1]["handle"] is None:
+        blocks[-1]["size"] += size
+    else:
+        blocks.append(
+            {
+                "offset": pool["capacity"],
+                "size": size,
+                "handle": None,
+                "tag": None,
+            }
+        )
+    pool["capacity"] = new_capacity
+    return {"capacity": new_capacity, "added": size}
 
 
 def validate(pool: dict, handles: Iterable[str]) -> list[str]:
@@ -169,7 +343,59 @@ def validate(pool: dict, handles: Iterable[str]) -> list[str]:
     This function must not mutate the pool and must not raise ``PoolError``
     for a merely inconsistent pool; report the issue instead.
     """
-    raise NotImplementedError
+    issues = []
+    capacity = pool["capacity"]
+    blocks = pool["blocks"]
+    live = [block for block in blocks if block["handle"] is not None]
+    live_handles = {block["handle"] for block in live}
+
+    # Handles used by more than one live block.
+    seen_live = set()
+    for block in live:
+        handle = block["handle"]
+        if handle in seen_live:
+            issues.append(
+                f"duplicate handle {handle!r} is used by more than one live block"
+            )
+        seen_live.add(handle)
+
+    # Supplied handles, in input order.
+    seen_supplied = set()
+    for handle in handles:
+        if handle in seen_supplied:
+            issues.append(f"duplicate handle {handle!r} supplied more than once")
+        elif handle not in live_handles:
+            issues.append(f"unknown handle {handle!r} is not live in this pool")
+        seen_supplied.add(handle)
+
+    # Live extents outside [0, capacity).
+    for block in live:
+        end = block["offset"] + block["size"]
+        if block["offset"] < 0 or end > capacity:
+            issues.append(
+                f"live extent {block['handle']!r} at "
+                f"[{block['offset']}, {end}) falls outside [0, {capacity})"
+            )
+
+    # Overlaps between any extents (live/live or live/free).
+    ordered = sorted(blocks, key=lambda block: block["offset"])
+    previous_end = None
+    previous_desc = None
+    for block in ordered:
+        if previous_end is not None and block["offset"] < previous_end:
+            issues.append(
+                f"extent at offset {block['offset']} overlaps extent "
+                f"{previous_desc} ending at {previous_end}"
+            )
+        end = block["offset"] + block["size"]
+        if previous_end is None or end > previous_end:
+            previous_end = end
+            previous_desc = (
+                f"handle {block['handle']!r}"
+                if block["handle"] is not None
+                else "free extent"
+            )
+    return issues
 
 
 def pool_batch(pools: Sequence[dict], requests: Sequence[Mapping]) -> dict:
@@ -201,4 +427,34 @@ def pool_batch(pools: Sequence[dict], requests: Sequence[Mapping]) -> dict:
     batch are unique. An empty request sequence returns an empty allocation
     list.
     """
-    raise NotImplementedError
+    snapshots = [copy.deepcopy(pool) for pool in pools]
+    allocations = []
+    try:
+        for request in requests:
+            placed = None
+            for index, pool in enumerate(pools):
+                try:
+                    record = allocate(pool, request)
+                except PoolError:
+                    continue
+                placed = {
+                    "pool": index,
+                    "handle": record["handle"],
+                    "offset": record["offset"],
+                    "size": record["size"],
+                    "tag": request["tag"],
+                }
+                break
+            if placed is None:
+                raise PoolError(
+                    f"no pool can satisfy request {dict(request)!r}; "
+                    "rolling back the whole batch"
+                )
+            allocations.append(placed)
+    except PoolError:
+        # All-or-nothing: restore every pool to its pre-call layout.
+        for pool, snapshot in zip(pools, snapshots):
+            pool.clear()
+            pool.update(snapshot)
+        raise
+    return {"allocations": allocations}
